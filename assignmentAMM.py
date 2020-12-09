@@ -13,15 +13,19 @@ import sys
 import matplotlib.pyplot as plt
 from autograd import grad, jacobian, hessian
 import csv
-
+import numdifftools as nd
+import time
 
 
 def logit_function(alpha, beta, price):
     """
     Function to calculate a univariate logit function
     """
-    
-    return math.exp(alpha + beta * price ) / ( 1 + math.exp(alpha + beta * price))
+    try:
+        a = math.exp(alpha + beta * price ) / ( 1 + math.exp(alpha + beta * price))
+    except OverflowError:
+        a = 1
+    return a
 
 
 def likelihood_single_obs(alpha, beta, price, y):
@@ -44,7 +48,10 @@ def LogL(theta, segment_prob, y, X):
             for j in range(int(theta.shape[0]/2)):
                 to_add = segment_prob[j] * likelihood_single_obs(theta[2 * j], theta[2 * j + 1], X[t, 1], y[i, t])
                 sum_total = sum_total + to_add
-            log_sum_total = math.log(sum_total)
+            try:
+                log_sum_total = math.log(sum_total)
+            except:
+                log_sum_total = sys.float_info.min
             start_sum = start_sum + log_sum_total
     return start_sum
 
@@ -80,8 +87,8 @@ def Estep(theta, pi, y, X):
         N-by-T array of of individual conditional cluster probabilities
     """
     
-    P = np.zeros((250, k))
-    for i in range(250):
+    P = np.zeros((y.shape[0], k))
+    for i in range(y.shape[0]):
         denom = 0
         for j in range(k):
             denom += pi[j] * likelihood_single_individual(theta[2 * j], theta[2 * j + 1], X, y[i,:])
@@ -116,12 +123,16 @@ def Mstep(W, y, X, starting_theta, starting_pi):
         new pi values
     """
     
-    denom = W.sum(axis = 0)
-    new_pi = denom / denom.sum()
+    new_pi = W.sum(axis = 0) / W.shape[0]
 
-    res = minimize(function_mstep, x0 = starting_theta, args =(W,y,X),  method='Nelder-Mead', options = {'maxiter': 250, 'disp': True} )
-    new_theta = res.x
+    # res = minimize(function_mstep, x0 = starting_theta, args =(W,y,X),  method='BFGS', options = {'maxiter': 250, 'disp': True} )
+    new_theta = np.zeros(starting_theta.shape[0])
+    for i in range(int(starting_theta.shape[0]/2)):
+        res = minimize(function_mstep_by_matrix, x0 = starting_theta[2*i:2*i+2], args =(W[:,i],y,X),  method='BFGS', options = {'maxiter': 1000, 'disp': True} )
+        new_theta[2*i:2*i+2] = res.x
+    
     return new_theta, new_pi
+
 
 def function_mstep(starting_theta, W, y, X):
     """
@@ -155,10 +166,23 @@ def function_mstep(starting_theta, W, y, X):
                     a = sys.float_info.min
                 inner_sum = inner_sum + math.log(a)
             start_sum = start_sum + W[i,j] * inner_sum
+    
     return -1 * start_sum
 
 
-def EM(y, X, k):
+def test_functions():
+    start = time.time()
+    for i in range(100):
+        function_mstep_by_matrix(starting_theta, W_s, Y, X)
+    print(time.time()-start)
+
+def function_mstep_by_matrix(starting_theta, W_s, y, X):
+    A = np.matmul(X, starting_theta).astype(float)
+    B = np.repeat((np.exp(A) / (1 + np.exp(A))).reshape(1,-1), y.shape[0], axis = 0)
+    D = np.matmul(W_s.transpose(), np.log((np.power(B, Y) * np.power(1 - B, 1 - Y)).astype(float)).sum(axis = 1).reshape(-1,1))
+    return -1 * D
+    
+def EM(y, X, k, tolerance):
     """
     Function that initialises random starting values for the logit parameters and the segment probabilities 
     and then iterates the E- and M-step until a stopping criterium is met
@@ -185,16 +209,24 @@ def EM(y, X, k):
     print("Running EM for k = " + str(k))
     
     #Set stopping criteria. Either maximum number of iterations or segment probabilities don't improve anymore.
-    epsilon = 0.001
+    epsilon = tolerance
     count_iter = 0
-    max_iter = 50
+    max_iter = 150
     
     #Lists to store results
     logLs = []
     pis = []
     
     #Set random starting values
-    theta = np.random.uniform(low = -0.5, high = 0.5, size = 2 * k)
+    theta = np.zeros(2 * k)
+    for i in range( 2* k):
+        if i % 2 == 0:
+            # generate alpha
+            theta[i] = np.random.normal(1,0.5,1)
+        else:
+            # generate beta
+            theta[i] = np.random.normal(-1,0.5,1)
+    # generate pi
     pi = np.full(k, 1/k)
 
     stopping_condition = False
@@ -205,8 +237,9 @@ def EM(y, X, k):
         print("at iteration " + str(count_iter + 1) + " of " + str(max_iter) + " of the EM function.")
         P = Estep(theta, pi, y, X)
         new_theta, new_pi = Mstep(P, y, X, theta, pi)
+        change_in_pi = max(abs(new_pi-pi))
         distance_pi = np.linalg.norm(new_pi - pi)
-        if distance_pi < epsilon :
+        if change_in_pi < epsilon :
             print("stopping as segment probabilities are not imporving anymore")
             stopping_condition = True
         theta = new_theta
@@ -224,7 +257,7 @@ def EM(y, X, k):
     return logLs, theta, pis
 
 
-def Estimate(y, X, k):
+def Estimate(y, X, k, tolerance):
     """
     runs the EM function a number of times with different (random) starting values 
     in order to prevent getting stuck at a local optimum.
@@ -238,7 +271,7 @@ def Estimate(y, X, k):
     for i in range(10):
         print("\n")
         print("NOW in LOOP " + str(i + 1) + " of the estimate loop")
-        logLs, theta, pis = EM(y, X, k)
+        logLs, theta, pis = EM(y, X, k, tolerance)
         
         #make tuple for theta and the last value of the pi result list
         params = (theta, pis[-1])
@@ -252,7 +285,6 @@ def transform_pi_to_gamma(pi):
     gamma = np.zeros(k - 1)
     for i in range((k-1)):
         gamma[i] = math.log(pi[i]) - math.log(pi[k-1])
-    
     return gamma
 
 def transform_gamma_to_pi(gamma):
@@ -261,7 +293,6 @@ def transform_gamma_to_pi(gamma):
     pi = np.zeros(k)
     gamma_sum = sum(np.exp(gamma))
     for i in range(k):
-        print(i)
         if i == (k - 1):
             pi[i] = 1 / (1 + gamma_sum)
         else:
@@ -269,12 +300,17 @@ def transform_gamma_to_pi(gamma):
     
     return pi
 
-def new_logL(theta, gamma, y, X):
+def new_logL(theta_gamma, y, X, k):
     
-    pi = transform_gamma_to_pi(gamma)
-    
-    value = LogL(theta, pi, y, X)
-    return value
+    pi = transform_gamma_to_pi(theta_gamma[2*k:])
+    value = LogL(theta_gamma[:2 * k], pi, y, X)
+    return -1 *value
+
+#def new_logL(theta, gamma, y, X):
+ #   pi = transform_gamma_to_pi(gamma)
+  #  value = LogL(theta, pi, y, X)
+   # return value
+
 
 if __name__ == "__main__":
     data = pd.read_csv('433246.csv')
@@ -290,12 +326,12 @@ if __name__ == "__main__":
         X_df.iat[week - 1, 1] = row["price"]
     
     print("data loaded")
-
-    k = 3
+    
+    k = 2
     Y = Y_df.to_numpy()
     X = X_df.to_numpy()
     
-    results = Estimate(Y, X, k)
+    results = Estimate(Y, X, k, tolerance = 0.0001)
     
     with open('data.csv', 'w') as f:
         for key in results.keys():
@@ -307,13 +343,18 @@ if __name__ == "__main__":
     bestPi = bestParams[1]
     bestGamma = transform_pi_to_gamma(bestPi)
     
-    hessian_ = hessian(new_logL)
-    H = hessian_(bestTheta, bestGamma, Y, X)
-    cov = np.inv(-1 * H)
+    
+    theta_gamma = np.concatenate((bestTheta, bestGamma)).astype(float)
+    
+    hessian = nd.Hessian(new_logL)(list(theta_gamma), Y, X, k )
+    cov_matrix = np.linalg.inv(-1*hessian)
+    
+    standard_errors = np.zeros(2 * k)
+    for i in range(cov_matrix.shape[0]):
+        standard_errors[i] = max(0, cov_matrix[i,i])
     
     #Test the performance of EM step and plot the loglikelihoods and the segment probabilities of the EM loop
     
-    logLs, theta, pis = EM(Y, X, k)
     plt.plot(logLs)
     pis_array = np.asarray(pis)
     fig, ax = plt.subplots()
